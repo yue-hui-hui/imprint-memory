@@ -9,7 +9,7 @@ Built as an [MCP server](https://modelcontextprotocol.io/) — works with Claude
 - **Memory CRUD** — store, search, list, and delete memories
 - **Hybrid search** — FTS5 keyword search + bge-m3 vector embeddings + time decay scoring
 - **Daily logs** — append-only daily journal files
-- **Message bus** — cross-channel message log (for multi-channel setups)
+- **Message bus** — shared message log across sources
 - **Task queue** — submit tasks for Claude Code to execute asynchronously
 - **Bank files** — auto-indexes markdown files in a `bank/` directory for semantic search
 
@@ -69,8 +69,9 @@ Claude Code will automatically have access to these tools:
 | `memory_forget` | Delete memories by keyword |
 | `memory_list` | List recent memories |
 | `memory_daily_log` | Append to today's log |
-| `message_bus_read` | Read cross-channel message history |
+| `message_bus_read` | Read recent message bus history |
 | `message_bus_post` | Write to the message bus |
+| `conversation_search` | Search conversation history by keyword |
 | `cc_execute` | Submit a task for Claude Code |
 | `cc_check` | Check task status |
 | `cc_tasks` | List recent tasks |
@@ -140,6 +141,35 @@ Or via environment variables: `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_A
         ├── experience.md
         └── preferences.md
 ```
+
+## Console
+
+Check system status at a glance:
+
+```bash
+imprint-console            # status + live log
+imprint-console --status   # status snapshot only
+```
+
+Shows: database stats, Ollama status, data files, HTTP server status.
+
+## Context compression (optional)
+
+If you maintain a rolling context file (e.g. `recent_context.md`), you can compress older messages with a local Ollama model:
+
+```bash
+python3 -m imprint_memory.compress /path/to/recent_context.md
+```
+
+Configure via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMPRESS_MODEL` | `qwen3:8b` | Ollama model for summarization |
+| `COMPRESS_KEEP` | `30` | Recent lines to keep as-is |
+| `COMPRESS_THRESHOLD` | `50` | Line count that triggers compression |
+
+If Ollama is unavailable, falls back to truncation (keeps only the most recent lines).
 
 ## Part of Claude Imprint
 

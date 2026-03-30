@@ -35,6 +35,7 @@ Issues = "https://github.com/Qizhan7/imprint-memory/issues"
 
 [project.scripts]
 imprint-memory = "imprint_memory.server:main"
+imprint-console = "imprint_memory.console:main"
 
 [build-system]
 requires = ["hatchling"]

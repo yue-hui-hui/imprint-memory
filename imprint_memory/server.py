@@ -24,9 +24,11 @@ if __name__ == "__main__" or not __package__:
 from mcp.server.fastmcp import FastMCP
 from .memory_manager import (
     remember, search_text, forget, daily_log, get_all,
+    delete_memory, update_memory, find_duplicates, find_stale,
 )
 from .bus import bus_post, bus_format
 from .tasks import submit_task, check_task, list_tasks
+from .conversation import search_conversations, format_search_results
 
 is_http = "--http" in sys.argv
 
@@ -43,7 +45,7 @@ mcp = FastMCP(
 def memory_remember(content: str, category: str = "general", source: str = "cc", importance: int = 5) -> str:
     """Store a memory. Call this when you encounter important information.
     category: facts/events/tasks/experience/general
-    source: cc/telegram/wechat/chat"""
+    source: free-form label for where the info came from (e.g. cc, chat, api)"""
     return remember(content=content, category=category, source=source, importance=importance)
 
 
@@ -77,22 +79,85 @@ def memory_list(category: Optional[str] = None, limit: int = 20) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def memory_delete(memory_id: int) -> str:
+    """Delete a single memory by ID. Safer than memory_forget (no accidental matches)."""
+    result = delete_memory(memory_id)
+    if result["ok"]:
+        return f"Deleted memory #{memory_id}"
+    return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def memory_update(memory_id: int, content: str = "", category: str = "", importance: int = 0) -> str:
+    """Update a memory by ID. Only pass fields you want to change.
+    content: new content (empty = keep). category: new category (empty = keep). importance: new value (0 = keep)."""
+    result = update_memory(memory_id, content=content, category=category, importance=importance)
+    if result["ok"]:
+        return f"Updated memory #{memory_id}"
+    return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def memory_find_duplicates(threshold: float = 0.85) -> str:
+    """Find semantically similar memory pairs (read-only). For dedup audits.
+    threshold: cosine similarity threshold, default 0.85."""
+    pairs = find_duplicates(threshold=threshold)
+    if not pairs:
+        return "No similar memory pairs found above threshold"
+    lines = [f"Found {len(pairs)} similar pairs:\n"]
+    for p in pairs:
+        lines.append(
+            f"  [{p['similarity']:.3f}] #{p['id_a']} ({p['category_a']}) vs #{p['id_b']} ({p['category_b']})\n"
+            f"    A: {p['content_a']}\n"
+            f"    B: {p['content_b']}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def memory_find_stale(days: int = 14) -> str:
+    """Find potentially stale memories: older than N days, low importance, rarely recalled (read-only)."""
+    items = find_stale(days=days)
+    if not items:
+        return f"No low-activity memories older than {days} days"
+    lines = [f"Found {len(items)} low-activity memories:\n"]
+    for m_item in items:
+        lines.append(
+            f"  #{m_item['id']} [{m_item['category']}] imp={m_item['importance']} recalled={m_item['recalled_count']} ({m_item['created_at']})\n"
+            f"    {m_item['content'][:120]}"
+        )
+    return "\n".join(lines)
+
+
 # --- Message Bus Tools ------------------------------------------------
 
 @mcp.tool()
 def message_bus_read(limit: int = 20) -> str:
-    """Read recent cross-channel messages. Every channel (Telegram/WeChat/Chat/CC) logs sent
-    and received messages here. Use this to understand what happened in other channels."""
+    """Read recent messages from the message bus. All sources log sent/received
+    messages here. Use this to see what happened across different sources."""
     return bus_format(limit)
 
 
 @mcp.tool()
 def message_bus_post(source: str, direction: str, content: str) -> str:
-    """Write a message to the cross-channel message bus.
-    source: telegram/wechat/chat/cc_task/scheduled
-    direction: in (user sent) / out (Claude sent)"""
+    """Write a message to the message bus.
+    source: free-form label (e.g. cc, chat, api, webhook)
+    direction: in (received) / out (sent)"""
     bus_post(source, direction, content)
     return "Written to message bus"
+
+
+# --- Conversation Search Tools ----------------------------------------
+
+@mcp.tool()
+def conversation_search(query: str, platform: str = "", limit: int = 20) -> str:
+    """Search conversation history using keywords.
+    query: search keywords (space-separated)
+    platform: leave empty to search all, or filter by platform name
+    limit: max results, default 20"""
+    results = search_conversations(query=query, platform=platform, limit=limit)
+    return format_search_results(results)
 
 
 # --- CC Task Tools ----------------------------------------------------

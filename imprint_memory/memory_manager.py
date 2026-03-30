@@ -87,7 +87,12 @@ def datetime_strptime(s: str):
 
 def remember(content: str, category: str = "general", source: str = "cc",
              tags: Optional[list[str]] = None, importance: int = 5) -> str:
-    """Store a memory."""
+    """Store a memory with automatic dedup and conflict detection.
+    - Exact duplicate content → skip
+    - Semantic similarity ≥ 0.92 → skip (nearly identical)
+    - Semantic similarity 0.85~0.92 → supersede: old memory marked historical, new one stored
+    - Semantic similarity < 0.85 → new memory, stored directly
+    """
     db = _get_db()
 
     existing = db.execute(
@@ -96,6 +101,30 @@ def remember(content: str, category: str = "general", source: str = "cc",
     if existing:
         db.close()
         return "Duplicate memory, skipped"
+
+    # Generate embedding early (reused for semantic dedup + storage)
+    vec = _embed(content)
+
+    # Semantic dedup: check active memories in same category
+    DUPLICATE_THRESHOLD = 0.92   # Nearly identical, skip
+    SUPERSEDE_THRESHOLD = 0.85   # Similar but updated, supersede old
+    supersede_ids = []
+
+    if vec:
+        cat_rows = db.execute(
+            """SELECT m.id, m.content, v.embedding FROM memories m
+               JOIN memory_vectors v ON m.id = v.memory_id
+               WHERE m.category = ? AND m.superseded_by IS NULL""",
+            (category,),
+        ).fetchall()
+        for r in cat_rows:
+            existing_vec = _blob_to_vec(r["embedding"])
+            sim = _cosine_similarity(vec, existing_vec)
+            if sim >= DUPLICATE_THRESHOLD:
+                db.close()
+                return f"Semantically similar memory exists (ID {r['id']}, similarity {sim:.3f}). Use update_memory to update it."
+            elif sim >= SUPERSEDE_THRESHOLD:
+                supersede_ids.append((r["id"], r["content"][:40], sim))
 
     tags_json = json.dumps(tags or [], ensure_ascii=False)
     now = now_str()
@@ -107,17 +136,29 @@ def remember(content: str, category: str = "general", source: str = "cc",
     )
     memory_id = cursor.lastrowid
 
-    vec = _embed(content)
     if vec:
         db.execute(
             "INSERT INTO memory_vectors (memory_id, embedding, model) VALUES (?, ?, ?)",
             (memory_id, _vec_to_blob(vec), EMBED_MODEL),
         )
 
+    # Mark old memories as historical (not deleted, just superseded)
+    supersede_notes = []
+    for old_id, old_preview, sim in supersede_ids:
+        db.execute(
+            "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
+            (memory_id, now, old_id),
+        )
+        supersede_notes.append(f"  ↳ Superseded #{old_id} ({old_preview}… sim {sim:.3f})")
+
     db.commit()
     db.close()
     _rebuild_index()
-    return f"Remembered [{category}]: {content[:50]}..."
+
+    result = f"Remembered [{category}]: {content[:50]}..."
+    if supersede_notes:
+        result += "\n" + "\n".join(supersede_notes)
+    return result
 
 
 def forget(keyword: str) -> str:
@@ -204,7 +245,7 @@ def search(query: str, limit: int = 10, category: Optional[str] = None) -> list[
                    m.created_at, m.recalled_count, rank
             FROM memories_fts f
             JOIN memories m ON f.rowid = m.id
-            WHERE memories_fts MATCH ? {cat_filter}
+            WHERE memories_fts MATCH ? AND m.superseded_by IS NULL {cat_filter}
             ORDER BY rank LIMIT {limit * 2}
         """, params).fetchall()
 
@@ -232,7 +273,7 @@ def search(query: str, limit: int = 10, category: Optional[str] = None) -> list[
                    m.created_at, m.recalled_count, v.embedding
             FROM memories m
             JOIN memory_vectors v ON m.id = v.memory_id
-            WHERE 1=1 {cat_filter}
+            WHERE m.superseded_by IS NULL {cat_filter}
         """, params).fetchall()
 
         scored = []
@@ -257,13 +298,16 @@ def search(query: str, limit: int = 10, category: Optional[str] = None) -> list[
     # 3. Combined scoring
     for mid, info in results.items():
         recency = _recency_score(info["created_at"])
+        # recalled_count as tiny tiebreaker (max 0.05, prevents snowball)
+        recall_bonus = min(0.05, 0.01 * math.log1p(info.get("recalled_count", 0)))
         info["final_score"] = (
             WEIGHT_VECTOR * info["vec_score"]
             + WEIGHT_FTS * info["fts_score"]
             + WEIGHT_RECENCY * recency
+            + recall_bonus
         )
 
-    MIN_SCORE = 0.35
+    MIN_SCORE = 0.40
     ranked = [r for r in results.values() if r["final_score"] >= MIN_SCORE]
     ranked.sort(key=lambda x: x["final_score"], reverse=True)
     ranked = ranked[:limit]
@@ -363,6 +407,52 @@ def record_notification(content: str):
     )
     db.commit()
     db.close()
+
+
+# ─── Memory Health Tools ────────────────────────────────
+
+def find_duplicates(threshold: float = 0.85) -> list[dict]:
+    """Find memory pairs with cosine similarity above threshold. Read-only."""
+    db = _get_db()
+    rows = db.execute("""
+        SELECT m.id, m.content, m.category, v.embedding
+        FROM memories m
+        JOIN memory_vectors v ON m.id = v.memory_id
+    """).fetchall()
+    db.close()
+
+    pairs = []
+    for i in range(len(rows)):
+        vec_i = _blob_to_vec(rows[i]["embedding"])
+        for j in range(i + 1, len(rows)):
+            vec_j = _blob_to_vec(rows[j]["embedding"])
+            sim = _cosine_similarity(vec_i, vec_j)
+            if sim >= threshold:
+                pairs.append({
+                    "id_a": rows[i]["id"],
+                    "content_a": rows[i]["content"][:100],
+                    "category_a": rows[i]["category"],
+                    "id_b": rows[j]["id"],
+                    "content_b": rows[j]["content"][:100],
+                    "category_b": rows[j]["category"],
+                    "similarity": round(sim, 4),
+                })
+    pairs.sort(key=lambda x: x["similarity"], reverse=True)
+    return pairs
+
+
+def find_stale(days: int = 14) -> list[dict]:
+    """Find potentially stale memories: older than N days, importance < 7, recalled < 3. Read-only."""
+    db = _get_db()
+    cutoff = (now_local() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    rows = db.execute("""
+        SELECT id, content, category, importance, recalled_count, created_at
+        FROM memories
+        WHERE created_at < ? AND importance < 7 AND recalled_count < 3
+        ORDER BY created_at ASC
+    """, (cutoff,)).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
 
 
 # ─── Memory Context ──────────────────────────────────────
@@ -502,18 +592,25 @@ def _search_bank(query_vec, query_text: str, limit: int = 5) -> list[dict]:
                     "final_score": sim,
                 })
 
+    # Keyword search — score no longer hardcoded, merges with vector results
+    KEYWORD_BASE = 0.5
+    KEYWORD_BONUS = 0.15
+    DUAL_HIT_BONUS = 0.1
     query_lower = query_text.lower()
     rows = db.execute("SELECT chunk_text, file_path FROM bank_chunks").fetchall()
     for r in rows:
         if query_lower in r["chunk_text"].lower():
-            entry = {
-                "content": r["chunk_text"],
-                "source": Path(r["file_path"]).stem,
-                "category": "bank",
-                "final_score": 0.8,
-            }
-            if not any(x["content"] == entry["content"] for x in results):
-                results.append(entry)
+            kw_score = KEYWORD_BASE + KEYWORD_BONUS  # 0.65
+            existing = next((x for x in results if x["content"] == r["chunk_text"]), None)
+            if existing:
+                existing["final_score"] = max(existing["final_score"], kw_score) + DUAL_HIT_BONUS
+            else:
+                results.append({
+                    "content": r["chunk_text"],
+                    "source": Path(r["file_path"]).stem,
+                    "category": "bank",
+                    "final_score": kw_score,
+                })
 
     db.close()
     results.sort(key=lambda x: x["final_score"], reverse=True)

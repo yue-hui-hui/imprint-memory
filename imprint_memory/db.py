@@ -48,7 +48,8 @@ def _init_tables(db: sqlite3.Connection):
             importance INTEGER DEFAULT 5,
             recalled_count INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
-            updated_at TEXT
+            updated_at TEXT,
+            superseded_by INTEGER REFERENCES memories(id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS memory_vectors (
@@ -96,7 +97,30 @@ def _init_tables(db: sqlite3.Connection):
             content TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS conversation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            speaker TEXT DEFAULT '',
+            content TEXT NOT NULL,
+            session_id TEXT DEFAULT '',
+            entrypoint TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
     """)
+
+    # Migration: add superseded_by column if missing
+    mem_cols = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in db.execute("PRAGMA table_info(memories)").fetchall()
+    }
+    if "superseded_by" not in mem_cols:
+        try:
+            db.execute("ALTER TABLE memories ADD COLUMN superseded_by INTEGER REFERENCES memories(id) ON DELETE SET NULL")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
     # Migration: add index_version column if missing
     bank_chunk_cols = {
@@ -119,6 +143,15 @@ def _init_tables(db: sqlite3.Connection):
     except sqlite3.OperationalError:
         pass
 
+    # FTS5 for conversation_log
+    try:
+        db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS conversation_log_fts
+            USING fts5(content, platform, speaker, content=conversation_log, content_rowid=id)
+        """)
+    except sqlite3.OperationalError:
+        pass
+
     # FTS5 sync triggers
     db.executescript("""
         CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -134,6 +167,15 @@ def _init_tables(db: sqlite3.Connection):
             VALUES ('delete', old.id, old.content, old.category, old.tags);
             INSERT INTO memories_fts(rowid, content, category, tags)
             VALUES (new.id, new.content, new.category, new.tags);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS convlog_ai AFTER INSERT ON conversation_log BEGIN
+            INSERT INTO conversation_log_fts(rowid, content, platform, speaker)
+            VALUES (new.id, new.content, new.platform, new.speaker);
+        END;
+        CREATE TRIGGER IF NOT EXISTS convlog_ad AFTER DELETE ON conversation_log BEGIN
+            INSERT INTO conversation_log_fts(conversation_log_fts, rowid, content, platform, speaker)
+            VALUES ('delete', old.id, old.content, old.platform, old.speaker);
         END;
     """)
     db.commit()

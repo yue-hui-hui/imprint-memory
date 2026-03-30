@@ -1,6 +1,6 @@
 """
-Cross-channel message bus.
-Shared "whiteboard" for logging messages sent/received across all channels.
+Message bus.
+Shared log for messages sent/received across different sources.
 """
 
 import os
@@ -11,8 +11,8 @@ MESSAGE_BUS_LIMIT = int(os.environ.get("MESSAGE_BUS_LIMIT", 40))
 
 def bus_post(source: str, direction: str, content: str) -> None:
     """Write a message to the bus. Auto-prunes old messages beyond limit.
-    source: telegram/wechat/chat/cc_task/scheduled/heartbeat
-    direction: in (user sent) / out (Claude sent)
+    source: free-form label (e.g. cc, chat, api, webhook)
+    direction: in (received) / out (sent)
     content: message content (auto-truncated to 200 chars)"""
     if len(content) > 200:
         content = content[:197] + "..."
@@ -45,8 +45,8 @@ def bus_format(limit: int = 20) -> str:
     """Format bus messages for context injection."""
     messages = bus_read(limit)
     if not messages:
-        return "(No recent cross-channel messages)"
-    lines = ["# Recent Cross-Channel Messages\n"]
+        return "(No recent messages)"
+    lines = ["# Recent Messages\n"]
     for m in messages:
         arrow = "\u2192" if m["direction"] == "out" else "\u2190"
         lines.append(f"[{m['created_at']}] [{m['source']}] {arrow} {m['content']}")
