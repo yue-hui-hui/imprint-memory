@@ -1,14 +1,17 @@
 """
 Claude Imprint — Memory System
 Pure memory operations: CRUD, hybrid search (FTS5 + bge-m3), bank indexing, daily log.
+Includes RRF unified retrieval across memory, bank, and conversation pools.
 """
 
 import json
 import math
 import os
+import re
+import sqlite3
 import struct
 import urllib.request
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +19,7 @@ from .db import (
     _get_db, now_local, now_str,
     DAILY_LOG_DIR, BANK_DIR, MEMORY_INDEX, LOCAL_TZ,
     segment_cjk, sanitize_fts_query,
+    _CJK_RE, _JIEBA_OK,
 )
 
 # ─── Embedding Config ────────────────────────────────────
@@ -822,5 +826,691 @@ def _rebuild_index():
 
     with open(MEMORY_INDEX, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+# RRF Unified Retrieval — fusion across memory, bank, conversation
+# ═══════════════════════════════════════════════════════════════
+
+RRF_K = 60              # RRF ranking constant (standard value)
+VEC_PRE_FILTER = 0.3    # Vector similarity pre-filter threshold
+MIN_FINAL_SCORE = 0.003 # Drop results below this after reranking
+RERANK_BLEND = 0.3      # How much rerank factors affect final score
+LIKE_LIMIT = 50         # Max results from LIKE exact-match channel per pool
+
+
+def _days_since(time_str: str, default: float = 30.0) -> float:
+    """Days elapsed since a timestamp string."""
+    if not time_str:
+        return default
+    try:
+        t = datetime.strptime(time_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
+        return max(0.0, (now_local() - t).total_seconds() / 86400)
+    except (ValueError, TypeError):
+        return default
+
+
+def _fts_query_cjk(query: str) -> str:
+    """Build an FTS5 MATCH expression with proper CJK tokenization."""
+    if not _CJK_RE.search(query):
+        return query
+
+    if _JIEBA_OK:
+        return segment_cjk(query)
+
+    parts = re.split(r'([\u4e00-\u9fff\u3400-\u4dbf\U00020000-\U0002a6df'
+                     r'\U0002a700-\U0002ebef\u3000-\u303f\uff00-\uffef]+)', query)
+    tokens = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if _CJK_RE.search(part):
+            chars = [c for c in part if _CJK_RE.match(c)]
+            if len(chars) >= 2:
+                tokens.append('"' + ' '.join(chars) + '"')
+            elif len(chars) == 1:
+                tokens.append(chars[0])
+        else:
+            tokens.append(part)
+    return ' '.join(tokens)
+
+
+def _sanitize_fts(query: str) -> str:
+    """Strip FTS5 operators and apply CJK segmentation."""
+    cleaned = re.sub(r'["\(\)\*\:\^\{\}]', " ", query)
+    cleaned = " ".join(cleaned.split()).strip()
+    if not cleaned:
+        return cleaned
+    return _fts_query_cjk(cleaned)
+
+
+# ─── RRF Core ───────────────────────────────────────────
+
+def _rrf_fuse(channel_rankings: list[list[tuple[str, int]]]) -> dict[str, float]:
+    """Reciprocal Rank Fusion over N ranked lists."""
+    scores: dict[str, float] = {}
+    for ranking in channel_rankings:
+        for key, rank in ranking:
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+    return scores
+
+
+_RANK_BASELINE = 10
+
+def _inject_default_ranks(
+    fts_ranking: list[tuple[str, int]],
+    vec_ranking: list[tuple[str, int]],
+) -> None:
+    """Give absent paired channel a default low rank so single-channel
+    results aren't unfairly penalised. Mirrors rankings when one channel
+    is completely empty (e.g. FTS can't tokenize the query)."""
+    if not fts_ranking and not vec_ranking:
+        return
+    if not fts_ranking and vec_ranking:
+        fts_ranking.extend(vec_ranking)
+        return
+    if not vec_ranking and fts_ranking:
+        vec_ranking.extend(fts_ranking)
+        return
+
+    fts_keys = {k for k, _ in fts_ranking}
+    vec_keys = {k for k, _ in vec_ranking}
+
+    default_fts = max(len(fts_ranking), _RANK_BASELINE) + 1
+    default_vec = max(len(vec_ranking), _RANK_BASELINE) + 1
+
+    for k in vec_keys - fts_keys:
+        fts_ranking.append((k, default_fts))
+    for k in fts_keys - vec_keys:
+        vec_ranking.append((k, default_vec))
+
+
+# ─── Rerank Functions ───────────────────────────────────
+
+def _rerank_memory(rrf_score: float, row: dict) -> float:
+    """Memory rerank: time x activation x importance, blended with RRF."""
+    if row.get("pinned"):
+        return rrf_score
+
+    importance = max(row.get("importance", 5), 1)
+    recalled = row.get("recalled_count", 0)
+
+    ref = row.get("last_accessed_at") or row.get("created_at", "")
+    days = _days_since(ref, default=30)
+    lam = 0.05 / (importance / 5)
+    time_factor = 0.4 + 0.6 * math.exp(-lam * days)
+
+    activation_factor = 0.8 + 0.2 * (math.log(recalled + 1) / math.log(51))
+    importance_factor = 0.7 + 0.3 * (importance / 10)
+
+    factor = time_factor * activation_factor * importance_factor
+    return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * factor)
+
+
+def _rerank_bank(rrf_score: float, row: dict) -> float:
+    """Bank rerank: gentle file freshness (tiebreaker only)."""
+    mtime = row.get("file_mtime")
+    if mtime is not None:
+        try:
+            dt = datetime.fromtimestamp(float(mtime), tz=LOCAL_TZ)
+            days = max(0.0, (now_local() - dt).total_seconds() / 86400)
+        except (ValueError, TypeError, OSError):
+            days = 7.0
+    else:
+        days = 7.0
+    freshness = 0.90 + 0.10 * math.exp(-days / 90)
+    return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * freshness)
+
+
+def _rerank_conv(rrf_score: float, row: dict) -> float:
+    """Conversation rerank: recency (7-day half-life)."""
+    days = _days_since(row.get("created_at", ""), default=30)
+    recency = 0.3 + 0.7 * math.exp(-days / 7)
+    return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * recency)
+
+
+# ─── Per-Pool Channel Search ────────────────────────────
+
+def _search_memory_channels(query, query_vec, db, *, category=None, limit=50):
+    """Return (fts_ranking, vec_ranking, like_ranking, details) for memory pool."""
+    details = {}
+    fts_ranking = []
+    vec_ranking = []
+
+    safe_q = _sanitize_fts(query)
+    if safe_q:
+        try:
+            cat_sql = "AND m.category = ?" if category else ""
+            params = [safe_q] + ([category] if category else []) + [limit]
+            fts_rows = db.execute(
+                f"""SELECT m.id, m.content, m.category, m.source, m.importance,
+                           m.created_at, m.recalled_count,
+                           m.last_accessed_at, m.pinned
+                    FROM memories_fts f
+                    JOIN memories m ON f.rowid = m.id
+                    WHERE memories_fts MATCH ? AND m.superseded_by IS NULL {cat_sql}
+                    ORDER BY f.rank
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+            for idx, r in enumerate(fts_rows):
+                key = f"mem_{r['id']}"
+                fts_ranking.append((key, idx + 1))
+                details[key] = dict(r)
+        except Exception:
+            pass
+
+    if query_vec:
+        cat_sql = "AND m.category = ?" if category else ""
+        params = [category] if category else []
+        vec_rows = db.execute(
+            f"""SELECT m.id, m.content, m.category, m.source, m.importance,
+                       m.created_at, m.recalled_count,
+                       m.last_accessed_at, m.pinned,
+                       v.embedding
+                FROM memories m
+                JOIN memory_vectors v ON m.id = v.memory_id
+                WHERE m.superseded_by IS NULL {cat_sql}""",
+            params,
+        ).fetchall()
+
+        scored = []
+        for r in vec_rows:
+            sim = _cosine_similarity(query_vec, _blob_to_vec(r["embedding"]))
+            if sim >= VEC_PRE_FILTER:
+                scored.append((r, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        for idx, (r, sim) in enumerate(scored[:limit]):
+            key = f"mem_{r['id']}"
+            vec_ranking.append((key, idx + 1))
+            if key not in details:
+                details[key] = dict(r)
+            details[key]["vec_similarity"] = sim
+
+    like_ranking = []
+    q_lower = query.lower()
+    if len(q_lower) >= 2:
+        cat_sql = "AND category = ?" if category else ""
+        params = [f"%{q_lower}%"] + ([category] if category else []) + [LIKE_LIMIT]
+        like_rows = db.execute(
+            f"""SELECT id, content, category, source, importance,
+                       created_at, recalled_count,
+                       last_accessed_at, pinned
+                FROM memories
+                WHERE LOWER(content) LIKE ? AND superseded_by IS NULL {cat_sql}
+                ORDER BY created_at DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        for idx, r in enumerate(like_rows):
+            key = f"mem_{r['id']}"
+            like_ranking.append((key, idx + 1))
+            if key not in details:
+                details[key] = dict(r)
+
+    return fts_ranking, vec_ranking, like_ranking, details
+
+
+def _search_bank_channels(query, query_vec, db, *, limit=50):
+    """Return (fts_ranking, vec_ranking, like_ranking, details) for bank pool."""
+    _index_bank_files()
+    details = {}
+    fts_ranking = []
+    vec_ranking = []
+
+    q_lower = query.lower()
+    kw_rows = db.execute(
+        "SELECT id, chunk_text, file_path, file_mtime FROM bank_chunks"
+    ).fetchall()
+    matches = [r for r in kw_rows if q_lower in r["chunk_text"].lower()]
+    for idx, r in enumerate(matches[:limit]):
+        key = f"bank_{r['id']}"
+        fts_ranking.append((key, idx + 1))
+        details[key] = {
+            "id": r["id"],
+            "content": r["chunk_text"],
+            "source": Path(r["file_path"]).stem,
+            "file_path": r["file_path"],
+            "file_mtime": r["file_mtime"],
+            "category": "bank",
+        }
+
+    if query_vec:
+        v_rows = db.execute(
+            "SELECT id, chunk_text, file_path, file_mtime, embedding "
+            "FROM bank_chunks WHERE embedding IS NOT NULL"
+        ).fetchall()
+        scored = []
+        for r in v_rows:
+            sim = _cosine_similarity(query_vec, _blob_to_vec(r["embedding"]))
+            if sim >= VEC_PRE_FILTER:
+                scored.append((r, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        for idx, (r, sim) in enumerate(scored[:limit]):
+            key = f"bank_{r['id']}"
+            vec_ranking.append((key, idx + 1))
+            if key not in details:
+                details[key] = {
+                    "id": r["id"],
+                    "content": r["chunk_text"],
+                    "source": Path(r["file_path"]).stem,
+                    "file_path": r["file_path"],
+                    "file_mtime": r["file_mtime"],
+                    "category": "bank",
+                }
+            details[key]["vec_similarity"] = sim
+
+    like_ranking = []
+    return fts_ranking, vec_ranking, like_ranking, details
+
+
+def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
+    """Return (fts_ranking, vec_ranking, like_ranking, details) for conversation pool."""
+    details = {}
+    fts_ranking = []
+    vec_ranking = []
+
+    safe_q = _sanitize_fts(query)
+    if safe_q:
+        try:
+            if platform:
+                fts_rows = db.execute(
+                    """SELECT c.id, c.platform, c.direction, c.speaker, c.content, c.created_at
+                       FROM conversation_log_fts f
+                       JOIN conversation_log c ON c.id = f.rowid
+                       WHERE conversation_log_fts MATCH ? AND c.platform = ?
+                       ORDER BY f.rank
+                       LIMIT ?""",
+                    (safe_q, platform, limit),
+                ).fetchall()
+            else:
+                fts_rows = db.execute(
+                    """SELECT c.id, c.platform, c.direction, c.speaker, c.content, c.created_at
+                       FROM conversation_log_fts f
+                       JOIN conversation_log c ON c.id = f.rowid
+                       WHERE conversation_log_fts MATCH ?
+                       ORDER BY f.rank
+                       LIMIT ?""",
+                    (safe_q, limit),
+                ).fetchall()
+
+            for idx, r in enumerate(fts_rows):
+                key = f"conv_{r['id']}"
+                fts_ranking.append((key, idx + 1))
+                details[key] = dict(r)
+        except Exception:
+            pass
+
+    like_ranking = []
+    q_lower = query.lower()
+    if len(q_lower) >= 2:
+        if platform:
+            like_rows = db.execute(
+                """SELECT id, platform, direction, speaker, content, created_at
+                   FROM conversation_log
+                   WHERE LOWER(content) LIKE ? AND platform = ?
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (f"%{q_lower}%", platform, LIKE_LIMIT),
+            ).fetchall()
+        else:
+            like_rows = db.execute(
+                """SELECT id, platform, direction, speaker, content, created_at
+                   FROM conversation_log
+                   WHERE LOWER(content) LIKE ?
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (f"%{q_lower}%", LIKE_LIMIT),
+            ).fetchall()
+        for idx, r in enumerate(like_rows):
+            key = f"conv_{r['id']}"
+            like_ranking.append((key, idx + 1))
+            if key not in details:
+                details[key] = dict(r)
+
+    return fts_ranking, vec_ranking, like_ranking, details
+
+
+# ─── Graph Expansion ───────────────────────────────────
+
+def _expand_via_edges(results: list[dict], db, max_expand: int = 3) -> list[dict]:
+    """Append edge-connected memories to search results."""
+    existing_ids = {r["id"] for r in results if r.get("pool") == "memory"}
+    expanded = []
+
+    for r in results:
+        if r.get("pool") != "memory" or len(expanded) >= max_expand:
+            break
+        rid = r.get("id")
+        if not rid:
+            continue
+
+        try:
+            edges = db.execute("""
+                SELECT e.id, e.relation, e.context,
+                       CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END as neighbor_id
+                FROM memory_edges e
+                WHERE (e.source_id = ? OR e.target_id = ?)
+            """, (rid, rid, rid)).fetchall()
+        except Exception:
+            continue
+
+        for edge in edges:
+            nid = edge["neighbor_id"]
+            if nid in existing_ids or len(expanded) >= max_expand:
+                continue
+            neighbor = db.execute(
+                "SELECT * FROM memories WHERE id = ? AND superseded_by IS NULL", (nid,)
+            ).fetchone()
+            if neighbor:
+                existing_ids.add(nid)
+                expanded.append({
+                    "pool": "memory", "score": 0, "rrf_raw": 0,
+                    "source": "edge",
+                    "edge_relation": edge["relation"],
+                    "edge_context": edge["context"],
+                    **dict(neighbor),
+                })
+                db.execute(
+                    "UPDATE memory_edges SET surfaced_count = surfaced_count + 1 WHERE id = ?",
+                    (edge["id"],),
+                )
+
+    if expanded:
+        db.commit()
+
+    return results + expanded
+
+
+# ─── Unified Search ─────────────────────────────────────
+
+def unified_search(
+    query: str,
+    limit: int = 10,
+    pools: list[str] | None = None,
+    category: str | None = None,
+    platform: str = "",
+) -> list[dict]:
+    """Search across all memory pools with RRF fusion and per-pool reranking.
+
+    Args:
+        query:    natural-language search query
+        limit:    max results to return
+        pools:    subset of ["memory", "bank", "conversation"]; None = all
+        category: filter memory pool by category
+        platform: filter conversation pool by platform
+
+    Returns list of dicts sorted by final score, each containing:
+        pool, score, rrf_raw, id, content, + pool-specific fields
+    """
+    if pools is None:
+        pools = ["memory", "bank", "conversation"]
+
+    db = _get_db()
+    query_vec = _embed(query)
+    all_rankings: list[list[tuple[str, int]]] = []
+    all_details: dict[str, dict] = {}
+
+    if "memory" in pools:
+        m_fts, m_vec, m_like, m_det = _search_memory_channels(
+            query, query_vec, db, category=category
+        )
+        _inject_default_ranks(m_fts, m_vec)
+        all_rankings += [m_fts, m_vec, m_like]
+        all_details.update(m_det)
+
+    if "bank" in pools:
+        b_fts, b_vec, b_like, b_det = _search_bank_channels(query, query_vec, db)
+        _inject_default_ranks(b_fts, b_vec)
+        all_rankings += [b_fts, b_vec, b_like]
+        all_details.update(b_det)
+
+    if "conversation" in pools:
+        c_fts, c_vec, c_like, c_det = _search_conv_channels(
+            query, query_vec, db, platform=platform
+        )
+        if c_vec:
+            _inject_default_ranks(c_fts, c_vec)
+        all_rankings += [c_fts, c_vec, c_like]
+        all_details.update(c_det)
+
+    rrf_scores = _rrf_fuse(all_rankings)
+
+    # Per-pool rerank + within-pool normalisation
+    pool_items: dict[str, list[dict]] = {"memory": [], "bank": [], "conversation": []}
+
+    for key, rrf in rrf_scores.items():
+        detail = all_details.get(key, {})
+
+        if key.startswith("mem_"):
+            pool = "memory"
+            reranked = _rerank_memory(rrf, detail)
+        elif key.startswith("bank_"):
+            pool = "bank"
+            reranked = _rerank_bank(rrf, detail)
+        elif key.startswith("conv_"):
+            pool = "conversation"
+            reranked = _rerank_conv(rrf, detail)
+        else:
+            continue
+
+        if reranked < MIN_FINAL_SCORE:
+            continue
+
+        detail.pop("embedding", None)
+        pool_items[pool].append({
+            "pool": pool, "score": reranked, "rrf_raw": rrf, **detail
+        })
+
+    # Normalise within each pool so pools compete on equal footing
+    results: list[dict] = []
+    for pool, items in pool_items.items():
+        if not items:
+            continue
+        max_score = max(r["score"] for r in items)
+        for r in items:
+            r["score"] = r["score"] / max_score if max_score > 0 else 0
+        results.extend(items)
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    results = results[:limit]
+
+    # Graph expansion: append edge-connected memories
+    if "memory" in pools:
+        results = _expand_via_edges(results, db, max_expand=3)
+
+    # Side-effect: update last_accessed_at + recalled_count
+    mem_ids = [r["id"] for r in results if r.get("pool") == "memory"]
+    if mem_ids:
+        now = now_str()
+        for mid in mem_ids:
+            db.execute(
+                "UPDATE memories SET recalled_count = recalled_count + 1, "
+                "last_accessed_at = ? WHERE id = ?",
+                (now, mid),
+            )
+        db.commit()
+
+    db.close()
+    return results
+
+
+def unified_search_text(
+    query: str,
+    limit: int = 10,
+    pools: list[str] | None = None,
+    platform: str = "",
+) -> str:
+    """Format unified search results as readable text."""
+    results = unified_search(query, limit=limit, pools=pools, platform=platform)
+    if not results:
+        return "No matching results found"
+
+    _labels = {"memory": "Memory", "bank": "Bank", "conversation": "Conversation"}
+    lines: list[str] = []
+
+    for r in results:
+        label = _labels.get(r["pool"], r["pool"])
+        score = f"{r['score']:.4f}"
+        content = r.get("content", "")[:200]
+
+        if r["pool"] == "memory":
+            cat = r.get("category", "")
+            ts = r.get("created_at", "")
+            pin = " [pinned]" if r.get("pinned") else ""
+            if r.get("source") == "edge":
+                rel = r.get("edge_relation", "")
+                lines.append(f"[{label}|edge|{rel}] {content}")
+            else:
+                lines.append(f"[{label}|{cat}|{ts}]{pin} ({score}) {content}")
+
+        elif r["pool"] == "bank":
+            src = r.get("source", "")
+            lines.append(f"[{label}|{src}] ({score}) {content}")
+
+        elif r["pool"] == "conversation":
+            plat = r.get("platform", "")
+            dire = "<-" if r.get("direction") == "in" else "->"
+            ts = r.get("created_at", "")
+            lines.append(f"[{label}|{plat}{dire}|{ts}] ({score}) {content}")
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Pin / Tag / Edge operations
+# ═══════════════════════════════════════════════════════════════
+
+def pin_memory(memory_id: int) -> dict:
+    """Pin a memory. Pinned memories bypass all time-decay in search."""
+    db = _get_db()
+    row = db.execute("SELECT id FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row:
+        db.close()
+        return {"ok": False, "error": f"Memory {memory_id} not found"}
+    pinned_count = db.execute("SELECT COUNT(*) as c FROM memories WHERE pinned = 1").fetchone()["c"]
+    db.execute("UPDATE memories SET pinned = 1, updated_at = ? WHERE id = ?", (now_str(), memory_id))
+    db.commit()
+    db.close()
+    result = {"ok": True, "pinned": memory_id}
+    if pinned_count >= 20:
+        result["warning"] = f"Already {pinned_count} pinned memories — consider keeping under 20"
+    return result
+
+
+def unpin_memory(memory_id: int) -> dict:
+    """Unpin a memory, restoring normal time-decay."""
+    db = _get_db()
+    row = db.execute("SELECT id FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row:
+        db.close()
+        return {"ok": False, "error": f"Memory {memory_id} not found"}
+    db.execute("UPDATE memories SET pinned = 0, updated_at = ? WHERE id = ?", (now_str(), memory_id))
+    db.commit()
+    db.close()
+    return {"ok": True, "unpinned": memory_id}
+
+
+def add_tags(memory_id: int, tags: list[str]) -> dict:
+    """Add tags to a memory (writes to memory_tags table and updates memories.tags JSON)."""
+    db = _get_db()
+    row = db.execute("SELECT id, tags FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row:
+        db.close()
+        return {"ok": False, "error": f"Memory {memory_id} not found"}
+
+    added = []
+    for tag in tags:
+        t = tag.strip()
+        if t:
+            try:
+                db.execute("INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)", (memory_id, t))
+                added.append(t)
+            except sqlite3.IntegrityError:
+                pass
+
+    if added:
+        existing_tags = json.loads(row["tags"] or "[]")
+        merged = list(dict.fromkeys(existing_tags + added))
+        db.execute("UPDATE memories SET tags = ? WHERE id = ?",
+                   (json.dumps(merged, ensure_ascii=False), memory_id))
+
+    db.commit()
+    db.close()
+    return {"ok": True, "memory_id": memory_id, "added": added}
+
+
+def get_tags(memory_id: int) -> list[str]:
+    """Get all tags for a memory."""
+    db = _get_db()
+    rows = db.execute("SELECT tag FROM memory_tags WHERE memory_id = ?", (memory_id,)).fetchall()
+    db.close()
+    return [r["tag"] for r in rows]
+
+
+def add_edge(source_id: int, target_id: int, relation: str, context: str) -> dict:
+    """Create a bidirectional edge between two memories."""
+    if source_id == target_id:
+        return {"ok": False, "error": "Cannot create edge to self"}
+
+    db = _get_db()
+
+    for mid in (source_id, target_id):
+        row = db.execute("SELECT id FROM memories WHERE id = ?", (mid,)).fetchone()
+        if not row:
+            db.close()
+            return {"ok": False, "error": f"Memory {mid} not found"}
+
+    existing = db.execute("""
+        SELECT id FROM memory_edges
+        WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)
+    """, (source_id, target_id, target_id, source_id)).fetchone()
+    if existing:
+        db.close()
+        return {"ok": False, "error": f"Edge already exists (edge #{existing['id']})"}
+
+    cursor = db.execute("""
+        INSERT INTO memory_edges (source_id, target_id, relation, context, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (source_id, target_id, relation.strip(), context.strip(), now_str()))
+    db.commit()
+    db.close()
+    return {"ok": True, "edge_id": cursor.lastrowid}
+
+
+def get_edges(memory_id: int) -> list[dict]:
+    """Get all edges for a memory, including neighbor previews."""
+    db = _get_db()
+    rows = db.execute("""
+        SELECT e.id, e.source_id, e.target_id, e.relation, e.context,
+               e.surfaced_count, e.used_count, e.created_at,
+               CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END as neighbor_id
+        FROM memory_edges e
+        WHERE e.source_id = ? OR e.target_id = ?
+    """, (memory_id, memory_id, memory_id)).fetchall()
+
+    edges = []
+    for r in rows:
+        neighbor = db.execute(
+            "SELECT content, category FROM memories WHERE id = ?", (r["neighbor_id"],)
+        ).fetchone()
+        edges.append({
+            "edge_id": r["id"],
+            "source_id": r["source_id"],
+            "target_id": r["target_id"],
+            "neighbor_id": r["neighbor_id"],
+            "neighbor_preview": neighbor["content"][:80] if neighbor else "(deleted)",
+            "neighbor_category": neighbor["category"] if neighbor else "",
+            "relation": r["relation"],
+            "context": r["context"],
+            "surfaced_count": r["surfaced_count"],
+            "used_count": r["used_count"],
+            "created_at": r["created_at"],
+        })
+    db.close()
+    return edges
 
 

@@ -40,11 +40,15 @@ cd imprint-memory && pip install -e .
 | Tool | Description |
 |------|-------------|
 | `memory_remember` | Store a memory (category, source, importance) |
-| `memory_search` | Hybrid search across all memories |
+| `memory_search` | **RRF unified search** across memories, bank, and conversations |
 | `memory_list` | List recent memories |
 | `memory_update` | Update a memory by ID |
 | `memory_delete` | Delete a memory by ID |
 | `memory_forget` | Delete memories matching a keyword |
+| `memory_pin` / `memory_unpin` | Pin/unpin core memories (pinned = no time-decay) |
+| `memory_add_tags` | Add tags to a memory (comma-separated) |
+| `memory_add_edge` | Link two memories with a typed relationship |
+| `memory_get_graph` | View a memory's tags, edges, and neighbor previews |
 | `memory_find_duplicates` | Find semantically similar pairs (dedup audit) |
 | `memory_find_stale` | Find low-activity old memories |
 | `memory_decay` | Reduce importance of inactive memories (dry-run by default) |

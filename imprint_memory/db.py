@@ -151,6 +151,27 @@ def _init_tables(db: sqlite3.Connection):
             entrypoint TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS memory_tags (
+            memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            tag TEXT NOT NULL,
+            PRIMARY KEY (memory_id, tag)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tags_tag ON memory_tags(tag);
+
+        CREATE TABLE IF NOT EXISTS memory_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            target_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            relation TEXT NOT NULL,
+            context TEXT NOT NULL,
+            surfaced_count INTEGER DEFAULT 0,
+            used_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(source_id, target_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id);
     """)
 
     # Migration: add superseded_by column if missing
@@ -161,6 +182,22 @@ def _init_tables(db: sqlite3.Connection):
     if "superseded_by" not in mem_cols:
         try:
             db.execute("ALTER TABLE memories ADD COLUMN superseded_by INTEGER REFERENCES memories(id) ON DELETE SET NULL")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+    # Migration: add pinned column
+    if "pinned" not in mem_cols:
+        try:
+            db.execute("ALTER TABLE memories ADD COLUMN pinned INTEGER DEFAULT 0")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+    # Migration: add last_accessed_at column
+    if "last_accessed_at" not in mem_cols:
+        try:
+            db.execute("ALTER TABLE memories ADD COLUMN last_accessed_at TEXT")
         except sqlite3.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise

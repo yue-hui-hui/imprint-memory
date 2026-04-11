@@ -26,6 +26,8 @@ from .memory_manager import (
     remember, search_text, forget, daily_log, get_all,
     delete_memory, update_memory, find_duplicates, find_stale, decay,
     reindex_embeddings,
+    unified_search_text, pin_memory, unpin_memory,
+    add_tags, get_tags, add_edge, get_edges,
 )
 from .bus import bus_post, bus_format
 from .tasks import submit_task, check_task, list_tasks
@@ -53,8 +55,10 @@ def memory_remember(content: str, category: str = "general", source: str = "cc",
 
 @mcp.tool()
 def memory_search(query: str, limit: int = 10) -> str:
-    """Search memories. Supports semantic search (natural language) when Ollama is running."""
-    return search_text(query=query, limit=limit)
+    """Search across all memory pools (memories, knowledge bank, conversations) using RRF fusion.
+    Combines FTS5 keyword, vector semantic, and exact-match channels with per-pool reranking.
+    Falls back to keyword-only if no embedding provider is configured."""
+    return unified_search_text(query=query, limit=limit)
 
 
 @mcp.tool()
@@ -157,6 +161,74 @@ def memory_decay(days: int = 30, dry_run: bool = True) -> str:
             lines.append(f"  #{a['id']} [{a['category']}] {a['importance']} — {a['content']}")
     if not result["details_decayed"] and not result["details_archived"]:
         lines.append("No memories need decay at this time.")
+    return "\n".join(lines)
+
+
+# --- Pin / Tag / Edge Tools -------------------------------------------
+
+@mcp.tool()
+def memory_pin(memory_id: int) -> str:
+    """Pin a core memory. Pinned memories bypass time-decay in search. Keep under 20."""
+    result = pin_memory(memory_id)
+    if result["ok"]:
+        msg = f"Pinned memory #{memory_id}"
+        if "warning" in result:
+            msg += f"\nWarning: {result['warning']}"
+        return msg
+    return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def memory_unpin(memory_id: int) -> str:
+    """Unpin a memory, restoring normal time-decay."""
+    result = unpin_memory(memory_id)
+    if result["ok"]:
+        return f"Unpinned memory #{memory_id}"
+    return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def memory_add_tags(memory_id: int, tags: str) -> str:
+    """Add tags to a memory. tags: comma-separated (e.g. "climbing,sport,V3")"""
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    if not tag_list:
+        return "Error: provide at least one tag"
+    result = add_tags(memory_id, tag_list)
+    if result["ok"]:
+        return f"Added tags to memory #{memory_id}: {', '.join(result['added'])}"
+    return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def memory_add_edge(source_id: int, target_id: int, relation: str, context: str) -> str:
+    """Create a link between two memories.
+    relation: relationship type (causal, analogy, evolution, contradiction, background, etc.)
+    context: one-line explanation of why they're related"""
+    result = add_edge(source_id, target_id, relation, context)
+    if result["ok"]:
+        return f"Created edge #{result['edge_id']}: memory #{source_id} <-> #{target_id} ({relation})"
+    return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def memory_get_graph(memory_id: int) -> str:
+    """View a memory's graph: tags + connected edges + neighbor previews."""
+    tags = get_tags(memory_id)
+    edges = get_edges(memory_id)
+
+    lines = [f"Memory #{memory_id} graph"]
+    lines.append(f"  Tags: {', '.join(tags) if tags else '(none)'}")
+    if edges:
+        lines.append(f"  Edges ({len(edges)}):")
+        for e in edges:
+            direction = "->" if e["source_id"] == memory_id else "<-"
+            lines.append(
+                f"    {direction} #{e['neighbor_id']} [{e['relation']}] {e['neighbor_preview']}"
+                f"\n      context: {e['context']}"
+                f"  (surfaced:{e['surfaced_count']}, used:{e['used_count']})"
+            )
+    else:
+        lines.append("  Edges: (none)")
     return "\n".join(lines)
 
 
