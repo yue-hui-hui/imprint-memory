@@ -308,7 +308,7 @@ def now_local() -> datetime:
 
 
 def now_str() -> str:
-    return now_local().strftime("%Y-%m-%d %H:%M")
+    return now_local().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # --- Init on import ---------------------------------------------------

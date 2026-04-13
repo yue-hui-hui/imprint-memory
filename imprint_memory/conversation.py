@@ -105,7 +105,7 @@ def get_recent(platform: str = "", exclude_platforms: list = None, limit: int = 
             rows = db.execute(
                 """SELECT id, platform, direction, speaker, content, session_id, entrypoint, created_at, summary
                    FROM conversation_log WHERE platform = ?
-                   ORDER BY id DESC LIMIT ?""",
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
                 (platform, limit),
             ).fetchall()
         elif exclude_platforms:
@@ -113,13 +113,13 @@ def get_recent(platform: str = "", exclude_platforms: list = None, limit: int = 
             rows = db.execute(
                 f"""SELECT id, platform, direction, speaker, content, session_id, entrypoint, created_at, summary
                    FROM conversation_log WHERE platform NOT IN ({placeholders})
-                   ORDER BY id DESC LIMIT ?""",
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
                 (*exclude_platforms, limit),
             ).fetchall()
         else:
             rows = db.execute(
                 """SELECT id, platform, direction, speaker, content, session_id, entrypoint, created_at, summary
-                   FROM conversation_log ORDER BY id DESC LIMIT ?""",
+                   FROM conversation_log ORDER BY created_at DESC, id DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]  # chronological order
@@ -129,8 +129,8 @@ def get_recent(platform: str = "", exclude_platforms: list = None, limit: int = 
 
 def format_recent(messages: list[dict], max_content_len: int = 300) -> str:
     """Format recent messages for recent_context.md.
-    Uses pre-computed summary if available; falls back to truncation."""
-    platform_short = {"telegram": "tg", "cc": "cc", "heartbeat": "hb"}
+    Collapses multiline content to single line and truncates if needed."""
+    platform_short = {"telegram": "tg", "wechat": "wx", "cc": "cc", "heartbeat": "hb"}
     lines = []
     for m in messages:
         p = platform_short.get(m["platform"], m["platform"])
@@ -140,18 +140,14 @@ def format_recent(messages: list[dict], max_content_len: int = 300) -> str:
         if len(ts) >= 16:
             ts = ts[5:16]
 
-        summary = m.get("summary", "")
         content = m["content"]
 
-        if summary:
-            # Has AI summary — use it with tag
-            display = f"[摘要] {summary}"
-        elif len(content) > max_content_len:
-            # No summary, too long — truncate as fallback
-            display = content[:max_content_len] + "..."
+        # Collapse multiline to single line for clean parsing
+        flat = " ".join(content.split())
+        if len(flat) > max_content_len:
+            display = flat[:max_content_len] + "..."
         else:
-            # Short enough — original text
-            display = content
+            display = flat
 
         lines.append(f"[{ts} {p}/{d}] {display}")
     return "\n".join(lines)
