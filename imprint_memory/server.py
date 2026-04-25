@@ -338,12 +338,12 @@ def cc_tasks(limit: int = 5) -> str:
 @mcp.tool()
 def experience_append(title: str, content: str) -> str:
     """Append a new experience entry to memory/bank/experience.md.
-    title: section heading (e.g. 'Port conflict debugging')
+    title: section heading (e.g. '端口冲突排查')
     content: markdown body (bullet points recommended)"""
     exp_path = Path(os.environ.get("IMPRINT_DATA_DIR", ".")) / "memory" / "bank" / "experience.md"
     if not exp_path.exists():
         exp_path.parent.mkdir(parents=True, exist_ok=True)
-        exp_path.write_text("# Experience Log\n")
+        exp_path.write_text("# 技术经验库\n")
     with open(exp_path, "a") as f:
         f.write(f"\n## {title}\n{content}\n")
     return f"Added experience: {title}"
@@ -493,6 +493,282 @@ def _run_http():
     server = uvicorn.Server(config)
     anyio.run(server.serve)
 
+
+
+# ──────────────────────────────────────────────────
+# WDA (WebDriverAgent) iPhone Control Tools
+# ──────────────────────────────────────────────────
+
+import os, urllib.request, urllib.error, subprocess
+
+def _patch_pymobiledevice3_dtx():
+    """Patch pymobiledevice3 to register XCTest services early (fixes xcuitest over RSD tunnels).
+    See: https://github.com/doronz88/pymobiledevice3/pull/1665"""
+    import importlib, site, pathlib
+    for base in site.getsitepackages() + [site.getusersitepackages()]:
+        target = pathlib.Path(base) / "pymobiledevice3/services/dvt/testmanaged/xcuitest.py"
+        if not target.exists():
+            continue
+        code = target.read_text()
+        patch_marker = "REGISTER_SERVICES"
+        if patch_marker in code:
+            return  # already patched
+        old = '    OLD_SERVICE_NAME = "com.apple.testmanagerd.lockdown"'
+        new = (
+            '    OLD_SERVICE_NAME = "com.apple.testmanagerd.lockdown"\n'
+            '    REGISTER_SERVICES = (\n'
+            '        XCTestManager_IDEInterface,\n'
+            '        XCTestManager_DaemonConnectionInterface,\n'
+            '        XCTestDriverInterface,\n'
+            '    )'
+        )
+        target.write_text(code.replace(old, new))
+        return
+
+WDA_DEVICE_ID = "YOUR_DEVICE_UDID"
+WDA_PROJECT_DIR = os.path.expanduser("~/Desktop/WebDriverAgent")
+WDA_TAILSCALE_IP = "YOUR_TAILSCALE_IP"
+WDA_BUNDLE_ID = "com.YOUR_TEAM.WebDriverAgentRunner.xctrunner"
+_wda_session_id: str | None = None
+_wda_base: str | None = None
+
+def _wda_discover_ip() -> str:
+    """Discover WDA IP. Tries Tailscale IP first (works anywhere), then WDA log, then LAN scan."""
+    global _wda_base
+    # 1. Try Tailscale IP first (works even when phone is on mobile data)
+    try:
+        url = "http://" + WDA_TAILSCALE_IP + ":8100/status"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            _wda_base = "http://" + WDA_TAILSCALE_IP + ":8100"
+            return _wda_base
+    except Exception:
+        pass
+    # 2. Try reading from WDA run log
+    try:
+        with open("/tmp/wda_run.log", "r") as f:
+            for line in f:
+                if "ServerURLHere" in line:
+                    import re
+                    m = re.search(r"http://[\d.]+:8100", line)
+                    if m:
+                        _wda_base = m.group(0)
+                        return _wda_base
+    except FileNotFoundError:
+        pass
+    # 3. Fallback: try common LAN IPs
+    for ip in ["192.168.1.14", "192.168.1.17", "192.168.1.15", "192.168.1.16"]:
+        try:
+            url = f"http://{ip}:8100/status"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                _wda_base = f"http://{ip}:8100"
+                return _wda_base
+        except Exception:
+            continue
+    return ""
+
+def _wda_request(method: str, path: str, body: dict | None = None) -> dict:
+    """Send request to WDA and return JSON response."""
+    import json as _json
+    base = _wda_base or _wda_discover_ip()
+    if not base:
+        return {"error": "WDA not reachable. Is it running? Try wda_start() first."}
+    url = f"{base}{path}"
+    data = _json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return _json.loads(resp.read())
+    except urllib.error.URLError as e:
+        return {"error": str(e)}
+
+def _wda_get_session() -> str:
+    """Get or create a WDA session."""
+    global _wda_session_id
+    if _wda_session_id:
+        r = _wda_request("GET", f"/session/{_wda_session_id}/window/size")
+        if "error" not in r:
+            return _wda_session_id
+    r = _wda_request("POST", "/session", {
+        "capabilities": {"alwaysMatch": {"platformName": "iOS"}}
+    })
+    _wda_session_id = r.get("sessionId") or r.get("value", {}).get("sessionId", "")
+    return _wda_session_id
+
+
+@mcp.tool()
+def wda_status() -> str:
+    """Check if WDA is running and ready. Returns device info and IP."""
+    r = _wda_request("GET", "/status")
+    if "error" in r:
+        return f"WDA not reachable: {r.get('error','unknown')}"
+    v = r.get("value", {})
+    return f"WDA ready={v.get('ready', False)}, iOS {v.get('os',{}).get('version','?')}, IP {v.get('ios',{}).get('ip','?')}, base={_wda_base}"
+
+
+@mcp.tool()
+def wda_screenshot() -> str:
+    """Take a screenshot of the iPhone screen. Returns path for view_image."""
+    import base64, time as _time
+    sid = _wda_get_session()
+    r = _wda_request("GET", f"/session/{sid}/screenshot")
+    if "error" in r:
+        return f"Screenshot failed: {r.get('error','unknown')}"
+    img_data = base64.b64decode(r.get("value", ""))
+    path = os.path.expanduser(f"~/screenshots/wda_{int(_time.time())}.png")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(img_data)
+    return f"Screenshot saved: {path}"
+
+
+@mcp.tool()
+def wda_tap(x: float, y: float) -> str:
+    """Tap a point on iPhone screen. iPhone 14 Pro: 393x852 points."""
+    sid = _wda_get_session()
+    r = _wda_request("POST", f"/session/{sid}/actions", {
+        "actions": [{
+            "type": "pointer",
+            "id": "finger1",
+            "parameters": {"pointerType": "touch"},
+            "actions": [
+                {"type": "pointerMove", "duration": 0, "x": int(x), "y": int(y)},
+                {"type": "pointerDown", "button": 0},
+                {"type": "pause", "duration": 100},
+                {"type": "pointerUp", "button": 0}
+            ]
+        }]
+    })
+    if "error" in r:
+        return f"Tap failed: {r.get('error','unknown')}"
+    return f"Tapped ({x}, {y})"
+
+
+@mcp.tool()
+def wda_swipe(fromX: float, fromY: float, toX: float, toY: float, duration: float = 0.1) -> str:
+    """Swipe on iPhone. Coords are points (393x852). duration in seconds.
+    Home gesture: (196,845)->(196,100) duration=0.08"""
+    sid = _wda_get_session()
+    r = _wda_request("POST", f"/session/{sid}/wda/dragfromtoforduration", {
+        "fromX": fromX, "fromY": fromY, "toX": toX, "toY": toY, "duration": duration
+    })
+    if "error" in r:
+        return f"Swipe failed: {r.get('error','unknown')}"
+    return f"Swiped ({fromX},{fromY}) -> ({toX},{toY})"
+
+
+@mcp.tool()
+def wda_type(text: str) -> str:
+    """Type text on iPhone. Tap an input field first to focus it."""
+    sid = _wda_get_session()
+    r = _wda_request("POST", f"/session/{sid}/wda/keys", {"value": list(text)})
+    if "error" in r:
+        return f"Type failed: {r.get('error','unknown')}"
+    return f"Typed: {text}"
+
+
+@mcp.tool()
+def wda_home() -> str:
+    """Go to home screen (swipe up from bottom, for Face ID iPhones)."""
+    sid = _wda_get_session()
+    r = _wda_request("POST", f"/session/{sid}/wda/dragfromtoforduration", {
+        "fromX": 196, "fromY": 845, "toX": 196, "toY": 100, "duration": 0.08
+    })
+    if "error" in r:
+        return f"Home failed: {r.get('error','unknown')}"
+    return "Swiped to home screen"
+
+
+@mcp.tool()
+def wda_source() -> str:
+    """Get UI element tree of current screen. Returns XML with labels and coordinates."""
+    sid = _wda_get_session()
+    r = _wda_request("GET", f"/session/{sid}/source")
+    if "error" in r:
+        return f"Source failed: {r.get('error','unknown')}"
+    src = str(r.get("value", ""))
+    if len(src) > 8000:
+        src = src[:8000] + "\n... (truncated)"
+    return src
+
+
+@mcp.tool()
+def wda_start() -> str:
+    """Start/restart WDA service on iPhone. Tries remote (Tailscale) first, falls back to local xcodebuild."""
+    global _wda_base, _wda_session_id
+    _wda_base = None
+    _wda_session_id = None
+    subprocess.run(["pkill", "-f", "xcodebuild.*test"], capture_output=True)
+    subprocess.run(["pkill", "-f", "pymobiledevice3.*xcuitest"], capture_output=True)
+
+    # Try remote start via Tailscale + RemotePairing tunnel
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((WDA_TAILSCALE_IP, 49152))
+        s.close()
+        # RemotePairing port is open — start via tunnel
+        tunnel_script = f"""
+import asyncio
+async def main():
+    from pymobiledevice3.remote.tunnel_service import (
+        create_core_device_tunnel_service_using_remotepairing,
+        start_tunnel, TunnelProtocol,
+    )
+    svc = await create_core_device_tunnel_service_using_remotepairing(
+        "{WDA_DEVICE_ID}", "{WDA_TAILSCALE_IP}", 49152)
+    async with start_tunnel(svc, protocol=TunnelProtocol.TCP) as t:
+        with open("/tmp/wda_tunnel.txt", "w") as f:
+            f.write(f"{{t.address}} {{t.port}}")
+        await asyncio.sleep(999999)
+asyncio.run(main())
+"""
+        subprocess.Popen(
+            f'echo "9999" | sudo -S python3.13 -c {repr(tunnel_script)}',
+            shell=True, stdout=open("/tmp/wda_tunnel.log", "w"), stderr=subprocess.STDOUT
+        )
+        import time
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                with open("/tmp/wda_tunnel.txt") as f:
+                    addr, port = f.read().strip().split()
+                break
+            except Exception:
+                continue
+        else:
+            return "Tunnel creation timed out. Try wda_start() again."
+
+        _patch_pymobiledevice3_dtx()
+        xcuitest_cmd = (
+            f"python3.12 -m pymobiledevice3 developer dvt xcuitest "
+            f"--rsd {addr} {port} {WDA_BUNDLE_ID} "
+            f"--env USE_PORT=8100 --env MJPEG_SERVER_PORT=9100"
+        )
+        subprocess.Popen(xcuitest_cmd, shell=True, stdout=open("/tmp/wda_run.log", "w"), stderr=subprocess.STDOUT)
+        return f"WDA starting via Tailscale tunnel ({addr}:{port}). Check wda_status() in ~15 seconds."
+    except (socket.error, OSError):
+        pass
+
+    # Fallback: local xcodebuild (same network / USB)
+    cmd = f"cd {WDA_PROJECT_DIR} && nohup xcodebuild test-without-building -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination 'id={WDA_DEVICE_ID}' > /tmp/wda_run.log 2>&1 &"
+    subprocess.Popen(cmd, shell=True)
+    return "WDA starting via xcodebuild (local). Check wda_status() in ~15 seconds."
+
+
+@mcp.tool()
+def wda_renew() -> str:
+    """Rebuild WDA to renew 7-day signing certificate. Takes 2-3 min."""
+    cmd = f"cd {WDA_PROJECT_DIR} && xcodebuild build-for-testing -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -destination 'id={WDA_DEVICE_ID}' -allowProvisioningUpdates"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+    if "BUILD SUCCEEDED" in result.stdout:
+        return "WDA renewal SUCCEEDED. Run wda_start() to restart."
+    else:
+        err = result.stderr[-500:] if result.stderr else result.stdout[-500:]
+        return f"WDA renewal FAILED: {err}"
 
 def main():
     """Entry point for console script and direct execution."""
