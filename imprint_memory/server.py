@@ -32,6 +32,7 @@ from .memory_manager import (
 from .bus import bus_post, bus_format
 from .tasks import submit_task, check_task, list_tasks
 from .conversation import search_conversations, format_search_results
+from .blackboard import blackboard_action
 
 is_http = "--http" in sys.argv
 
@@ -54,12 +55,11 @@ def memory_remember(content: str, category: str = "general", source: str = "cc",
 
 
 @mcp.tool()
-def memory_search(query: str, limit: int = 10, after: Optional[str] = None, before: Optional[str] = None) -> str:
+def memory_search(query: str, limit: int = 10) -> str:
     """Search across all memory pools (memories, knowledge bank, conversations) using RRF fusion.
     Combines FTS5 keyword, vector semantic, and exact-match channels with per-pool reranking.
-    Falls back to keyword-only if no embedding provider is configured.
-    after/before: ISO date strings to filter by time range (e.g. '2026-04-01' or '2026-04-01T10:00:00')."""
-    return unified_search_text(query=query, limit=limit, after=after, before=before)
+    Falls back to keyword-only if no embedding provider is configured."""
+    return unified_search_text(query=query, limit=limit)
 
 
 @mcp.tool()
@@ -75,10 +75,9 @@ def memory_daily_log(text: str) -> str:
 
 
 @mcp.tool()
-def memory_list(category: Optional[str] = None, limit: int = 20, after: Optional[str] = None, before: Optional[str] = None) -> str:
-    """List memories (newest first).
-    after/before: ISO date strings to filter by time range (e.g. '2026-04-01' or '2026-04-01T10:00:00')."""
-    items = get_all(category=category, limit=limit, after=after, before=before)
+def memory_list(category: Optional[str] = None, limit: int = 20) -> str:
+    """List memories (newest first)."""
+    items = get_all(category=category, limit=limit)
     if not items:
         return "No memories yet"
     lines = []
@@ -280,6 +279,33 @@ def search_channel(query: str, channel: str, limit: int = 20) -> str:
     return format_search_results(results)
 
 
+# --- Blackboard Tools -------------------------------------------------
+
+@mcp.tool()
+def memory_blackboard(action: str, scope: str, payload: str = "{}") -> str:
+    """Short-lived coding handoff area for TODOs and unfinished context.
+
+    action: read | write | check | uncheck | erase
+    scope: workspace/project identifier (e.g. "/home/ubuntu" or repo path)
+    payload: JSON object with action-specific data
+
+    Actions:
+      read    - List all open/checked items (payload: {})
+      write   - Create/update item (payload: {title, body?, priority?, refs?, ttl_hours?, item_id?})
+      check   - Mark done (payload: {item_id})
+      uncheck - Reopen (payload: {item_id})
+      erase   - Clear items (payload: {mode: "checked_only" | "all"})
+
+    Call read at session start. Call write before stopping or when discovering unfinished work.
+    Do NOT store: secrets, full logs, long-term preferences, full file contents."""
+    import json
+    try:
+        payload_dict = json.loads(payload) if payload else {}
+    except json.JSONDecodeError:
+        return '{"error": "Invalid JSON in payload"}'
+    return blackboard_action(action=action, scope=scope, payload=payload_dict)
+
+
 # --- CC Task Tools ----------------------------------------------------
 
 @mcp.tool()
@@ -333,20 +359,6 @@ def cc_tasks(limit: int = 5) -> str:
         sid = f" sid={t['session_id'][:8]}..." if t.get("session_id") else ""
         lines.append(f"[{icon}] #{t['task_id']} [{t['status']}]{sid} {t['prompt']}")
     return "\n".join(lines)
-
-
-@mcp.tool()
-def experience_append(title: str, content: str) -> str:
-    """Append a new experience entry to memory/bank/experience.md.
-    title: section heading (e.g. 'Port conflict debugging')
-    content: markdown body (bullet points recommended)"""
-    exp_path = Path(os.environ.get("IMPRINT_DATA_DIR", ".")) / "memory" / "bank" / "experience.md"
-    if not exp_path.exists():
-        exp_path.parent.mkdir(parents=True, exist_ok=True)
-        exp_path.write_text("# Experience Log\n")
-    with open(exp_path, "a") as f:
-        f.write(f"\n## {title}\n{content}\n")
-    return f"Added experience: {title}"
 
 
 # --- HTTP Mode with OAuth ---------------------------------------------

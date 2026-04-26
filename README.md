@@ -1,6 +1,14 @@
-# imprint-memory
+# imprint-memory (晦's fork)
+
+> **Fork of [Qizhan7/imprint-memory](https://github.com/Qizhan7/imprint-memory)**  
+> Thanks to the original author for building such a solid memory system! 🙏
 
 Persistent memory system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Gives Claude long-term memory that survives across conversations.
+
+## What's added in this fork
+
+- **Blackboard** — Short-lived coding handoff area for TODOs and unfinished context (`blackboard.py`)
+- **Associative recall** — When storing a memory, automatically returns top-3 semantically similar existing memories
 
 Built as an [MCP server](https://modelcontextprotocol.io/) — works locally (stdio) or remotely via HTTP with OAuth.
 
@@ -60,6 +68,7 @@ cd imprint-memory && pip install -e .
 | `message_bus_read` / `post` | Read/write the shared message bus |
 | `cc_execute` | Submit a task for Claude Code |
 | `cc_check` / `cc_tasks` | Check task status, list recent tasks |
+| `memory_blackboard` | Blackboard for short-lived TODOs (read/write/check/uncheck/erase) |
 
 ## Configuration
 

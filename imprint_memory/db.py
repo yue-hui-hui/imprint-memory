@@ -172,6 +172,21 @@ def _init_tables(db: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id);
+
+        CREATE TABLE IF NOT EXISTS blackboard (
+            id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            status TEXT DEFAULT 'open',
+            priority TEXT DEFAULT 'normal',
+            title TEXT NOT NULL,
+            body TEXT DEFAULT '',
+            refs TEXT DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_blackboard_scope ON blackboard(scope);
+        CREATE INDEX IF NOT EXISTS idx_blackboard_status ON blackboard(status);
     """)
 
     # Migration: add superseded_by column if missing
