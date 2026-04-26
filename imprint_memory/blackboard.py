@@ -56,17 +56,33 @@ def _format_response(scope: str, items: List[Dict], message: str = "") -> Dict[s
     }
 
 
-def blackboard_read(scope: str) -> Dict[str, Any]:
+def blackboard_read(scope: str, db=None) -> Dict[str, Any]:
     """Read all non-expired items for a scope."""
-    db = _get_db()
+    _close = db is None
+    if _close:
+        db = _get_db()
     now = now_str()
+    now_dt = now_local()
     rows = db.execute(
         "SELECT * FROM blackboard WHERE scope = ? AND expires_at > ? ORDER BY priority DESC, created_at DESC",
         (scope, now)
     ).fetchall()
     items = [_row_to_item(r) for r in rows]
-    db.close()
-    return _format_response(scope, items)
+    if _close:
+        db.close()
+    result = _format_response(scope, items)
+
+    # Check for items expiring within 24 hours
+    expiring = []
+    for item in items:
+        expires_dt = datetime.strptime(item["expires_at"], "%Y-%m-%d %H:%M:%S")
+        if (expires_dt - now_dt).total_seconds() < 86400:
+            expiring.append(item["id"])
+    if expiring:
+        result["warning"] = f"{len(expiring)} item(s) expiring within 24h"
+        result["expiring_ids"] = expiring
+
+    return result
 
 
 def blackboard_write(
@@ -111,8 +127,9 @@ def blackboard_write(
         message = f"Created item {item_id}"
 
     db.commit()
-    result = blackboard_read(scope)
+    result = blackboard_read(scope, db=db)
     result["message"] = message
+    result["item_id"] = item_id
     db.close()
     return result
 
@@ -126,7 +143,7 @@ def blackboard_check(scope: str, item_id: str) -> Dict[str, Any]:
         (now, item_id, scope)
     )
     db.commit()
-    result = blackboard_read(scope)
+    result = blackboard_read(scope, db=db)
     result["message"] = f"Checked item {item_id}"
     db.close()
     return result
@@ -141,7 +158,7 @@ def blackboard_uncheck(scope: str, item_id: str) -> Dict[str, Any]:
         (now, item_id, scope)
     )
     db.commit()
-    result = blackboard_read(scope)
+    result = blackboard_read(scope, db=db)
     result["message"] = f"Unchecked item {item_id}"
     db.close()
     return result
@@ -159,7 +176,7 @@ def blackboard_erase(scope: str, mode: str = "checked_only") -> Dict[str, Any]:
         db.execute("DELETE FROM blackboard WHERE scope = ? AND status = 'checked'", (scope,))
         message = "Erased checked items"
     db.commit()
-    result = blackboard_read(scope)
+    result = blackboard_read(scope, db=db)
     result["message"] = message
     db.close()
     return result
