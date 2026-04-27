@@ -241,6 +241,18 @@ def _init_tables(db: sqlite3.Connection):
             if "duplicate column name" not in str(e).lower():
                 raise
 
+    # Migration: add type column to blackboard (todo vs goal)
+    bb_cols = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in db.execute("PRAGMA table_info(blackboard)").fetchall()
+    }
+    if "type" not in bb_cols:
+        try:
+            db.execute("ALTER TABLE blackboard ADD COLUMN type TEXT DEFAULT 'todo'")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
     # Migration: add index_version column if missing
     bank_chunk_cols = {
         row["name"] if isinstance(row, sqlite3.Row) else row[1]
